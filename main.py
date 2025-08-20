@@ -1,80 +1,150 @@
-import flask
-from flask import request
+import logging
+import os
 import tempfile
+from typing import Optional
+
 import requests
 import whisper
-import os
-from twilio.rest import Client
 from dotenv import load_dotenv
+from flask import Flask, Response, request
+import threading
+from twilio.request_validator import RequestValidator
+from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Get Twilio Account SID, Auth Token, and From phone number from environment variables
-ACCOUNT_SID = os.environ.get("ACCOUNT_SID")
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
-FROM = os.environ.get("FROM")
+TWILIO_ACCOUNT_SID = os.getenv("ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.getenv("FROM", "")
+WHISPER_MODEL_NAME = os.getenv("MODEL_NAME", "small")
+PORT = int(os.getenv("PORT", "5000"))
+DEBUG_MODE = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes"}
+ASYNC_REPLY = os.getenv("ASYNC_REPLY", "false").lower() in {"1", "true", "yes"}
 
-client = Client(ACCOUNT_SID, AUTH_TOKEN)
+logger = logging.getLogger("audio-transcription-bot")
+logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO)
 
-app = flask.Flask(__name__)
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    logger.warning("Twilio credentials are not fully configured. Inbound validation and outbound messages may fail.")
 
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
 
-def transcribe_audio(audio_url, model_name="base"):
-    """Transcribe audio at the given URL using the specified model.
+app = Flask(__name__)
 
-    Args:
-        audio_url (str): URL of the audio to transcribe.
-        model_name (str, optional): Name of the model to use for transcription. Defaults to "base".
-
-    Returns:
-        str: Transcribed text.
-    """
-    model = whisper.load_model(model_name)
-    response = requests.get(audio_url)
-    with tempfile.TemporaryDirectory() as temp_dir:
-        audio_file_path = f"{temp_dir}/audio.tmp"
-        with open(audio_file_path, "wb") as audio_file:
-            audio_file.write(response.content)
-        result = model.transcribe(audio_file_path)
-    return result["text"]
+logger.info("Loading Whisper model '%s'...", WHISPER_MODEL_NAME)
+whisper_model = whisper.load_model(WHISPER_MODEL_NAME)
+logger.info("Whisper model loaded")
 
 
-def send_message(senderId, message):
-    """Send a message to the specified phone number.
-
-    Args:
-        senderId (str): Phone number to send the message to.
-        message (str): Message to send.
-
-    Returns:
-        twilio.rest.Message: Result of the message creation request.
-    """
-    res = client.messages.create(body=message, from_=FROM, to=f"whatsapp:+{senderId}")
-    return res
+def fetch_media_to_tempfile(media_url: str) -> str:
+    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_file:
+        with requests.get(media_url, stream=True, timeout=60, auth=auth) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    tmp_file.write(chunk)
+        return tmp_file.name
 
 
-@app.route("/")
-@app.route("/home")
-def home():
-    return "Hello World"
+def transcribe_audio_file(file_path: str) -> str:
+    result = whisper_model.transcribe(file_path)
+    return result.get("text", "")
 
 
-@app.route("/whatsapp", methods=["GET", "POST"])
-def whatsapp():
-    """Endpoint for handling incoming WhatsApp messages."""
+def is_audio_content_type(content_type: Optional[str]) -> bool:
+    if not content_type:
+        return False
+    return content_type.lower().startswith("audio/")
 
-    senderId = request.form["From"].split("+")[1]
-    mediaUrl = request.form["MediaUrl0"]
+
+def create_help_message() -> str:
+    return (
+        "Send a WhatsApp voice note or audio file and I'll transcribe it. "
+        "Supported: audio/* (e.g. OGG/Opus voice notes)."
+    )
+
+
+def send_outbound_message(to_e164: str, body: str) -> None:
+    if not twilio_client or not TWILIO_FROM_NUMBER:
+        logger.error("Twilio client or FROM number not configured; cannot send outbound message")
+        return
+    from_whatsapp = TWILIO_FROM_NUMBER
+    if not from_whatsapp.startswith("whatsapp:"):
+        from_whatsapp = f"whatsapp:{from_whatsapp}"
+    twilio_client.messages.create(body=body, from_=from_whatsapp, to=to_e164)
+
+
+@app.get("/")
+@app.get("/healthz")
+def health() -> tuple[str, int]:
+    return "ok", 200
+
+
+@app.post("/whatsapp")
+def whatsapp() -> Response:
+    if twilio_validator:
+        signature = request.headers.get("X-Twilio-Signature", "")
+        url = request.url
+        form = {k: v for k, v in request.form.items()}
+        if not twilio_validator.validate(url, form, signature):
+            logger.warning("Invalid Twilio signature")
+            return Response("Invalid signature", status=403)
+
+    from_number = request.form.get("From", "")
+    num_media = int(request.form.get("NumMedia", "0") or 0)
+    content_type = request.form.get("MediaContentType0") if num_media > 0 else None
+    media_url = request.form.get("MediaUrl0") if num_media > 0 else None
+
+    messaging_response = MessagingResponse()
+
+    if num_media == 0:
+        messaging_response.message(create_help_message())
+        return Response(str(messaging_response), mimetype="application/xml")
+
+    if not is_audio_content_type(content_type):
+        messaging_response.message("Please send an audio message. Received media is not recognized as audio.")
+        return Response(str(messaging_response), mimetype="application/xml")
 
     try:
-        response_message = transcribe_audio(mediaUrl)
-        send_message(senderId=senderId, message=response_message)
-    except Exception as e:
-        print(e)
-    return "200"
+        temp_path = fetch_media_to_tempfile(media_url) if media_url else None
+        if not temp_path:
+            raise RuntimeError("Failed to download media")
+
+        if ASYNC_REPLY and from_number:
+            messaging_response.message("Processing your audio. I will reply with the transcription shortly.")
+
+            def _process_and_send() -> None:
+                try:
+                    transcription_text = transcribe_audio_file(temp_path).strip() or "(no transcription)"
+                    send_outbound_message(to_e164=from_number, body=transcription_text)
+                except Exception as thread_exc:
+                    logger.exception("Background processing failed: %s", thread_exc)
+                finally:
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_process_and_send, daemon=True).start()
+            return Response(str(messaging_response), mimetype="application/xml")
+        else:
+            try:
+                transcription = transcribe_audio_file(temp_path).strip() or "(no transcription)"
+            finally:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            messaging_response.message(transcription)
+            return Response(str(messaging_response), mimetype="application/xml")
+    except Exception as exc:
+        logger.exception("Failed to process media: %s", exc)
+        messaging_response.message("Sorry, there was an error processing your audio.")
+        return Response(str(messaging_response), mimetype="application/xml", status=500)
 
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
-    # Remember to run ngrok to expose the local server to the internet
+    app.run(host="0.0.0.0", port=PORT, debug=DEBUG_MODE)

@@ -1,39 +1,81 @@
-# Audio Transcription WhatsApp Bot
+### Audio Transcription WhatsApp Bot
 
-A simple Flask application that allows users to send audio messages through WhatsApp and receive the transcribed text as a response, using OpenAI’s Whisper.
+Flask service that receives WhatsApp audio messages via Twilio and replies with a transcription using OpenAI Whisper.
 
-## Prerequisites
+### Why
 
-- Python 3.6 or higher
-- [Whisper](https://github.com/openai/whisper)
-- Flask
-- [Twilio](https://www.twilio.com/) account and WhatsApp API sandbox
-- [ngrok](https://ngrok.com/)
+WhatsApp voice notes are slow to skim. This bot turns them into text.
 
-## Setup
+### Features
 
-1. Clone this repository and navigate to the project directory.
-2. Install the required packages using pip:
+- Loads Whisper model once at startup
+- Validates Twilio signatures
+- Supports WhatsApp voice notes (OGG/Opus) and general `audio/*`
+- Sync or async replies via env flag
+- Health endpoint at `/healthz`
 
-`pip install -r requirements.txt`
+### Requirements
 
-3. Set up a [Twilio account](https://www.twilio.com/) and WhatsApp API sandbox.
-4. Create a file named .env in the root of the project directory and set the following environment variables:
+- Python 3.10+
+- ffmpeg installed on system path
+- Twilio WhatsApp Sandbox or Business API
 
-```yaml
-ACCOUNT_SID=YOUR_TWILIO_ACCOUNT_SID
-AUTH_TOKEN=YOUR_TWILIO_AUTH_TOKEN
-FROM=YOUR_TWILIO_PHONE_NUMBER
+### Install
+
+```bash
+pip install -r requirements.txt
 ```
 
-5. Run the application
-6. Expose the application using [ngrok](https://ngrok.com/):
+Install ffmpeg if you don't have it:
 
-`ngrok http 5000`
+```bash
+brew install ffmpeg
+```
 
-7. Make sure to follow the instructions in the [Twilio documentation](https://www.twilio.com/docs/whatsapp/quickstart/python) to set up your sandbox phone number and configure the webhook for incoming messages.
+### Configure
 
-## Usage
+Create a `.env` file:
 
-1. Send an audio message to the configured sandbox phone number through WhatsApp.
-2. The application will transcribe the audio and send the transcribed text back as a response.
+```bash
+ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+AUTH_TOKEN=your_auth_token
+FROM=whatsapp:+1415xxxxxxx
+MODEL_NAME=small
+PORT=5000
+DEBUG=false
+ASYNC_REPLY=false
+```
+
+Alternatively, copy and edit `env.sample` to `.env`.
+
+Notes:
+- `FROM` can be configured with or without the `whatsapp:` prefix; the app handles both.
+- `MODEL_NAME` options: `tiny`, `base`, `small`, `medium`, `large` (trade speed vs accuracy).
+- `ASYNC_REPLY=true` returns immediately and sends the transcription in a second message.
+
+### Run
+
+```bash
+python main.py
+```
+
+Expose locally for Twilio callbacks:
+
+```bash
+ngrok http 5000
+```
+
+Set your Twilio WhatsApp sandbox Inbound Webhook URL to:
+
+```
+POST https://<your-ngrok-domain>/whatsapp
+```
+
+### Usage
+
+- Send a voice note or audio file to your Twilio WhatsApp number
+- You will receive the transcription back
+
+### Notes on Cost
+
+Each audio incurs costs for messaging and compute. Whisper model size affects speed and cost; smaller models are faster and cheaper to run.
