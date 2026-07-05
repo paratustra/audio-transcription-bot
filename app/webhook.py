@@ -26,11 +26,13 @@ def _services() -> Services:
     return current_app.extensions["bot"]
 
 
-def _twiml(*messages: str, status: int = 200) -> Response:
+def _twiml(*messages: str) -> Response:
+    # Always 200: Twilio discards the TwiML body on a non-2xx status, so even
+    # error replies are returned as 200 to reach the user.
     response = MessagingResponse()
     for message in messages:
         response.message(message)
-    return Response(str(response), status=status, mimetype="application/xml")
+    return Response(str(response), mimetype="application/xml")
 
 
 @bp.get("/")
@@ -70,7 +72,9 @@ def whatsapp() -> Response:
         return _twiml("That audio is too large for me to process. Please send a shorter clip.")
     except Exception:
         logger.exception("Failed to download media")
-        return _twiml("Sorry, I couldn't download that audio. Please try again.", status=502)
+        # Return 200 so Twilio delivers this TwiML reply — a non-2xx status
+        # makes Twilio discard the body, and the user would hear nothing back.
+        return _twiml("Sorry, I couldn't download that audio. Please try again.")
 
     if services.config.async_reply and from_number and services.config.can_send_outbound:
         services.submit(_transcribe_and_reply, services, media, from_number)
@@ -80,7 +84,7 @@ def whatsapp() -> Response:
         text = services.transcriber.transcribe(media.path) or "(no speech detected)"
     except Exception:
         logger.exception("Transcription failed")
-        return _twiml("Sorry, there was an error transcribing your audio.", status=500)
+        return _twiml("Sorry, there was an error transcribing your audio.")
     finally:
         _remove(media)
     return _twiml(text)

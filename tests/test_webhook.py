@@ -69,6 +69,20 @@ def test_async_reply(transcriber):
     assert gw.sent == [("whatsapp:+14150000000", "hello world")]
 
 
+def test_transcription_error_still_replies_200(config, gateway):
+    # A non-2xx status makes Twilio drop the TwiML, so the user would hear
+    # nothing. Errors must come back as 200 with an apology in the body.
+    class Boom:
+        def transcribe(self, path):
+            raise RuntimeError("kaboom")
+
+    app = create_app(config, transcriber=Boom(), gateway=gateway)
+    resp = app.test_client().post("/whatsapp", data=_audio_form())
+    assert resp.status_code == 200
+    assert b"error transcribing" in resp.data.lower()
+    app.extensions["bot"].shutdown()
+
+
 def test_invalid_signature_returns_403(transcriber):
     cfg = Config(twilio_auth_token="tok", trusted_proxies=0)
     gw = FakeGateway(enforce=True)
