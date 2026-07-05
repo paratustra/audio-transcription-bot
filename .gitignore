@@ -98,3 +98,5 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# Ruff
+.ruff_cache/
